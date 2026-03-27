@@ -29,8 +29,8 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 from parameterized import parameterized
 
 # ── originals ────────────────────────────────────────────────────────────────
-from sonicmoe.functional.topk_softmax import TopK_Softmax as TopK_Softmax_Original
-from sonicmoe.functional.reduction_over_k_gather import (
+from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax as TopK_Softmax_Original
+from sonicmoe.functional.reduction_over_k_gather_hopper import (
     token_gather_and_sum_varlen_K_triton as gather_sum_original,
 )
 

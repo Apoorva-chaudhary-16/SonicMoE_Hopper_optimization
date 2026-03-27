@@ -18,7 +18,7 @@ from .moe_config import (
     HopperWgmma_MoE_Up_proj_ActGrad_Bwd,
     HopperWgmma_MoE_Up_proj_WeightGrad_Bwd,
 )
-from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
+from .reduction_over_k_gather_hopper import token_gather_and_sum_varlen_K_triton
 
 
 def _get_autotune_configs_for_db2_and_ds() -> list[triton.Config]:
