@@ -523,3 +523,7 @@ if __name__ == "__main__":
     test_fused_vs_separate(T=1024, E=128, k=8)
     test_fused_vs_separate(T=32768, E=256, k=16)
     print("All tests passed.")
+
+# Aliases so forward.py, bench_hopper_fa4.py, and test_hopper_fa4_correctness.py can import by expected names
+TopK_Softmax_Hopper = FusedRouterTopKSoftmax_SM90
+TopK_Softmax = FusedRouterTopKSoftmax_SM90
