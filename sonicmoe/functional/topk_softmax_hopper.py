@@ -164,8 +164,8 @@ class FusedRouterEpilogueTopKSoftmax_SM90:
         mLogits: cute.Tensor,
         mTopKValues: cute.Tensor,
         mTopKIndices: cute.Tensor,
-        T: int,
-        E: int,
+        T,
+        E,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -174,209 +174,199 @@ class FusedRouterEpilogueTopKSoftmax_SM90:
         col_lane     = tidx % self.threads_per_row
         global_row   = bidx * self.T_tile + row_in_block
 
-        if global_row >= T:
-            return
+        if global_row < T:
 
-        logit_row_ptr = mLogits[global_row, 0]
-        E_per_lane    = self.elems_per_thread
-        lane_start    = col_lane * E_per_lane
+            logit_row_ptr = mLogits[global_row, 0]
+            E_per_lane    = self.elems_per_thread
+            lane_start    = col_lane * E_per_lane
 
-        # -------------------------------------------------------------------
-        # Step 1: Load logits into registers and bit-pack the expert index
-        #   into the lower log_E mantissa bits of each FP32 value so that
-        #   the bitonic sort simultaneously sorts values AND carries indices.
-        #
-        #   Encoding rule:
-        #     positive val → store ~col_idx in lower bits (larger float →
-        #                    larger uint32, correct sort order preserved)
-        #     negative val → store  col_idx in lower bits
-        #
-        #   FIX (Issue 6 / Bug 3): We use the recast_tensor pair (regs /
-        #   regs_u32) which share the same register memory, so writing to
-        #   regs_u32[i] and reading regs[i] is a bitwise reinterpret — the
-        #   correct equivalent of __float_as_int / __int_as_float.
-        #   This replaces the previously proposed cute.arch.bitcast() which
-        #   does NOT exist in CUTLASS DSL 4.4.0 and would cause a compile
-        #   error.
-        # -------------------------------------------------------------------
-        idx_mask = const_expr((1 << self.log_E) - 1)
-        regs     = cute.make_rmem_tensor(E_per_lane, cutlass.Float32)
-        regs_u32 = cute.recast_tensor(regs, cutlass.Uint32)  # same memory, u32 view
+            # -------------------------------------------------------------------
+            # Step 1: Load logits into registers and bit-pack the expert index
+            #   into the lower log_E mantissa bits of each FP32 value so that
+            #   the bitonic sort simultaneously sorts values AND carries indices.
+            #
+            #   Encoding rule:
+            #     positive val → store ~col_idx in lower bits (larger float →
+            #                    larger uint32, correct sort order preserved)
+            #     negative val → store  col_idx in lower bits
+            #
+            #   FIX (Issue 6 / Bug 3): We use the recast_tensor pair (regs /
+            #   regs_u32) which share the same register memory, so writing to
+            #   regs_u32[i] and reading regs[i] is a bitwise reinterpret — the
+            #   correct equivalent of __float_as_int / __int_as_float.
+            #   This replaces the previously proposed cute.arch.bitcast() which
+            #   does NOT exist in CUTLASS DSL 4.4.0 and would cause a compile
+            #   error.
+            # -------------------------------------------------------------------
+            idx_mask = const_expr((1 << self.log_E) - 1)
+            regs     = cute.make_rmem_tensor(E_per_lane, cutlass.Float32)
+            regs_u32 = cute.recast_tensor(regs, cutlass.Uint32)  # same memory, u32 view
 
-        vec = const_expr(self.vec)
-        for v in cutlass.range_constexpr(E_per_lane // vec):
-            col_base = lane_start + v * vec
-            raw = cute.arch.load_128bit(logit_row_ptr + col_base, self.input_dtype, vec)
-            for j in cutlass.range_constexpr(vec):
-                val_f32 = raw[j].to(cutlass.Float32)
-                col_idx = cutlass.Uint32(col_base + j)
-                encoded = (
-                    (~col_idx if val_f32 >= cutlass.Float32(0.0) else col_idx) & idx_mask
+            vec = const_expr(self.vec)
+            for v in cutlass.range_constexpr(E_per_lane // vec):
+                col_base = lane_start + v * vec
+                # Load vec elements from global memory using element-wise access
+                raw = cute.make_rmem_tensor(vec, cutlass.Float32)
+                for load_idx in cutlass.range_constexpr(vec):
+                    raw[load_idx] = mLogits[global_row, col_base + load_idx].to(cutlass.Float32)
+                for j in cutlass.range_constexpr(vec):
+                    val_f32 = raw[j]
+                    col_idx = cutlass.Uint32(col_base + j)
+                    encoded = (
+                        (~col_idx if val_f32 >= cutlass.Float32(0.0) else col_idx) & idx_mask
+                    )
+                    # Write packed value: bitwise reinterpret via the recast pair.
+                    # regs_u32[i] and regs[i] are the same register memory viewed
+                    # as uint32 and float32 respectively — no numeric conversion.
+                    u32_val = regs_u32[v * vec + j]   # use existing slot as temp
+                    # We need val_f32's raw bits as uint32.
+                    # Step: write val_f32 as float, read as uint32 via the pair.
+                    regs[v * vec + j] = val_f32                      # store float bits
+                    raw_u32 = regs_u32[v * vec + j]                  # read as uint32 (bitwise)
+                    regs_u32[v * vec + j] = (raw_u32 & ~idx_mask) | encoded  # pack index
+
+            # -------------------------------------------------------------------
+            # Step 2: Online Softmax — single left-to-right pass over registers.
+            #
+            #   FIX (Bug 1/2): Call online_softmax_update() instead of inlining
+            #   broken logic.  The dead variable `val_f32 = regs[i]` in the
+            #   original read the BIT-PACKED value (not the clean float) but was
+            #   never actually used — now eliminated.
+            #
+            #   FIX (Issue 6 / Bug 3): Extract clean_f32 via the recast pair:
+            #     1. Save the packed u32.
+            #     2. Write clean_u32 (index bits stripped) into the slot.
+            #     3. Read as float via regs[i] (bitwise, not numeric).
+            #     4. Restore the packed value.
+            #   This avoids cute.arch.bitcast() which doesn't exist in 4.4.0.
+            # -------------------------------------------------------------------
+            running_max = -cutlass.Float32.inf
+            running_sum = cutlass.Float32(0.0)
+
+            for i in cutlass.range_constexpr(E_per_lane):
+                packed_u32 = regs_u32[i]
+                clean_u32  = packed_u32 & ~idx_mask
+                # Bitwise reinterpret: write clean uint32 bits, read as float.
+                regs_u32[i] = clean_u32
+                clean_f32   = regs[i]           # same register, float view
+                regs_u32[i] = packed_u32        # restore packed value
+
+                running_max, running_sum = online_softmax_update(
+                    clean_f32, running_max, running_sum
                 )
-                # Write packed value: bitwise reinterpret via the recast pair.
-                # regs_u32[i] and regs[i] are the same register memory viewed
-                # as uint32 and float32 respectively — no numeric conversion.
-                u32_val = regs_u32[v * vec + j]   # use existing slot as temp
-                # We need val_f32's raw bits as uint32.
-                # Step: write val_f32 as float, read as uint32 via the pair.
-                regs[v * vec + j] = val_f32                      # store float bits
-                raw_u32 = regs_u32[v * vec + j]                  # read as uint32 (bitwise)
-                regs_u32[v * vec + j] = (raw_u32 & ~idx_mask) | encoded  # pack index
 
-        # -------------------------------------------------------------------
-        # Step 2: Online Softmax — single left-to-right pass over registers.
-        #
-        #   FIX (Bug 1/2): Call online_softmax_update() instead of inlining
-        #   broken logic.  The dead variable `val_f32 = regs[i]` in the
-        #   original read the BIT-PACKED value (not the clean float) but was
-        #   never actually used — now eliminated.
-        #
-        #   FIX (Issue 6 / Bug 3): Extract clean_f32 via the recast pair:
-        #     1. Save the packed u32.
-        #     2. Write clean_u32 (index bits stripped) into the slot.
-        #     3. Read as float via regs[i] (bitwise, not numeric).
-        #     4. Restore the packed value.
-        #   This avoids cute.arch.bitcast() which doesn't exist in 4.4.0.
-        # -------------------------------------------------------------------
-        running_max = -cutlass.Float32.inf
-        running_sum = cutlass.Float32(0.0)
+            # -------------------------------------------------------------------
+            # Warp reduction: broadcast global (running_max, running_sum) to all
+            # threads in the same token row (threads_per_row threads per row).
+            #
+            #   FIX (Bug 4): Replaced Python `while stride > 0` with
+            #   cutlass.range_constexpr so the loop is compile-time unrolled to
+            #   PTX shuffle instructions.
+            #
+            #   FIX (Issue 7): Added the required full-warp mask (0xFFFFFFFF) as
+            #   the FIRST argument to shfl_xor_sync.  CUDA C signature is:
+            #     __shfl_xor_sync(unsigned mask, T var, int laneMask, int width)
+            #   The CUTLASS DSL maps this directly — omitting the mask caused
+            #   the shuffle to use an undefined register for the predicate.
+            # -------------------------------------------------------------------
+            if const_expr(self.threads_per_row > 1):
+                for log_step in cutlass.range_constexpr(self.log2_threads_per_row):
+                    stride = const_expr(self.threads_per_row >> (log_step + 1))
+                    # Issue 7 fix: pass _FULL_WARP_MASK as the first argument.
+                    peer_max = cute.arch.shfl_xor_sync(
+                        _FULL_WARP_MASK, running_max, stride, self.threads_per_row
+                    )
+                    peer_sum = cute.arch.shfl_xor_sync(
+                        _FULL_WARP_MASK, running_sum, stride, self.threads_per_row
+                    )
+                    new_max    = cute.arch.fmax(running_max, peer_max)
+                    my_scale   = cute.arch.exp2((running_max - new_max) * cutlass.Float32(LOG2E))
+                    peer_scale = cute.arch.exp2((peer_max   - new_max) * cutlass.Float32(LOG2E))
+                    running_sum = running_sum * my_scale + peer_sum * peer_scale
+                    running_max = new_max
+            # After the reduction: running_max and running_sum are identical across
+            # all threads_per_row lanes that share the same token row.
 
-        for i in cutlass.range_constexpr(E_per_lane):
-            packed_u32 = regs_u32[i]
-            clean_u32  = packed_u32 & ~idx_mask
-            # Bitwise reinterpret: write clean uint32 bits, read as float.
-            regs_u32[i] = clean_u32
-            clean_f32   = regs[i]           # same register, float view
-            regs_u32[i] = packed_u32        # restore packed value
+            # -------------------------------------------------------------------
+            # FIX (Bug 6): Warp barrier between the shuffle reduction and the
+            # bitonic sort.  Without this, threads may start reading `regs` in
+            # bitonic_topk before all threads finish writing packed values in
+            # Step 1, creating a race condition.
+            # -------------------------------------------------------------------
+            cute.arch.sync_warp()
 
-            running_max, running_sum = online_softmax_update(
-                clean_f32, running_max, running_sum
-            )
+            # -------------------------------------------------------------------
+            # Step 3: Bitonic TopK on the packed register array.
+            #   bitonic_topk distributes results across all threads_per_row lanes;
+            #   each thread holds k_per_lane = k / threads_per_row results.
+            # -------------------------------------------------------------------
+            from quack.sort.bitonic_sort import bitonic_topk as _bitonic_topk
 
-        # -------------------------------------------------------------------
-        # Warp reduction: broadcast global (running_max, running_sum) to all
-        # threads in the same token row (threads_per_row threads per row).
-        #
-        #   FIX (Bug 4): Replaced Python `while stride > 0` with
-        #   cutlass.range_constexpr so the loop is compile-time unrolled to
-        #   PTX shuffle instructions.
-        #
-        #   FIX (Issue 7): Added the required full-warp mask (0xFFFFFFFF) as
-        #   the FIRST argument to shfl_xor_sync.  CUDA C signature is:
-        #     __shfl_xor_sync(unsigned mask, T var, int laneMask, int width)
-        #   The CUTLASS DSL maps this directly — omitting the mask caused
-        #   the shuffle to use an undefined register for the predicate.
-        # -------------------------------------------------------------------
-        if const_expr(self.threads_per_row > 1):
-            for log_step in cutlass.range_constexpr(self.log2_threads_per_row):
-                stride = const_expr(self.threads_per_row >> (log_step + 1))
-                # Issue 7 fix: pass _FULL_WARP_MASK as the first argument.
-                peer_max = cute.arch.shfl_xor_sync(
-                    _FULL_WARP_MASK, running_max, stride, self.threads_per_row
+            topk_regs = _bitonic_topk(regs, self.next_pow2_k, warp_width=self.threads_per_row)
+
+            # -------------------------------------------------------------------
+            # Step 4: Decode indices and apply softmax normalization.
+            #
+            #   FIX (Bug 5): Sign check must be on the CLEAN float, not on the
+            #   bit-packed topk_regs[i] value (whose sign bits are corrupted by
+            #   the index stuffed into the mantissa).  Same recast-pair trick as
+            #   Step 2 to recover clean_f32.
+            #
+            #   FIX (Issue 6 / Bug 3): Bitwise reinterpret via recast pair.
+            #   FIX (Bug 7/8): Allocate k_per_lane outputs per thread (not k).
+            # -------------------------------------------------------------------
+            topk_u32 = cute.recast_tensor(topk_regs, cutlass.Uint32)
+
+            k_per_lane = const_expr(self.k_per_lane)
+            out_vals   = cute.make_rmem_tensor(k_per_lane, self.output_dtype)
+            out_idx    = cute.make_rmem_tensor(k_per_lane, cutlass.Int32)
+
+            inv_sum = cutlass.Float32(1.0) / running_sum
+
+            for i in cutlass.range_constexpr(k_per_lane):
+                encoded   = topk_u32[i] & idx_mask
+                clean_u32 = topk_u32[i] & ~idx_mask
+
+                # Bitwise reinterpret: write clean bits, read as float, restore.
+                packed_saved   = topk_u32[i]
+                topk_u32[i]    = clean_u32
+                clean_f32      = topk_regs[i]   # float view of same register
+                topk_u32[i]    = packed_saved
+
+                # FIX (Bug 5): sign check on clean_f32, not topk_regs[i].
+                col_idx = (
+                    (~encoded if clean_f32 >= cutlass.Float32(0.0) else encoded) & idx_mask
                 )
-                peer_sum = cute.arch.shfl_xor_sync(
-                    _FULL_WARP_MASK, running_sum, stride, self.threads_per_row
-                )
-                new_max    = cute.arch.fmax(running_max, peer_max)
-                my_scale   = cute.arch.exp2((running_max - new_max) * cutlass.Float32(LOG2E))
-                peer_scale = cute.arch.exp2((peer_max   - new_max) * cutlass.Float32(LOG2E))
-                running_sum = running_sum * my_scale + peer_sum * peer_scale
-                running_max = new_max
-        # After the reduction: running_max and running_sum are identical across
-        # all threads_per_row lanes that share the same token row.
+                out_idx[i] = cutlass.Int32(col_idx)
 
-        # -------------------------------------------------------------------
-        # FIX (Bug 6): Warp barrier between the shuffle reduction and the
-        # bitonic sort.  Without this, threads may start reading `regs` in
-        # bitonic_topk before all threads finish writing packed values in
-        # Step 1, creating a race condition.
-        # -------------------------------------------------------------------
-        cute.arch.syncwarp()
+                # Softmax weight via emulated exp2 (FA4 §3.2).
+                sm_val = cute.arch.exp2(
+                    (clean_f32 - running_max) * cutlass.Float32(LOG2E)
+                ) * inv_sum
+                out_vals[i] = sm_val.to(self.output_dtype)
 
-        # -------------------------------------------------------------------
-        # Step 3: Bitonic TopK on the packed register array.
-        #   bitonic_topk distributes results across all threads_per_row lanes;
-        #   each thread holds k_per_lane = k / threads_per_row results.
-        # -------------------------------------------------------------------
-        from quack.sort.bitonic_sort import bitonic_topk as _bitonic_topk
+            # -------------------------------------------------------------------
+            # Step 5: Write topK results to HBM.
+            #
+            #   FIX (Bug 7): Each thread writes its own k_per_lane slice starting
+            #   at col_lane * k_per_lane.  The original guarded all writes with
+            #   `if col_lane == 0`, discarding (threads_per_row-1)/threads_per_row
+            #   of the topK results silently.
+            #
+            #   FIX (Bug 8): Since every thread now writes its slice, the
+            #   normalization work done in Step 4 is fully utilized.
+            # -------------------------------------------------------------------
+            lane_out_start  = col_lane * k_per_lane
 
-        topk_regs = _bitonic_topk(regs, self.next_pow2_k, warp_width=self.threads_per_row)
-
-        # -------------------------------------------------------------------
-        # Step 4: Decode indices and apply softmax normalization.
-        #
-        #   FIX (Bug 5): Sign check must be on the CLEAN float, not on the
-        #   bit-packed topk_regs[i] value (whose sign bits are corrupted by
-        #   the index stuffed into the mantissa).  Same recast-pair trick as
-        #   Step 2 to recover clean_f32.
-        #
-        #   FIX (Issue 6 / Bug 3): Bitwise reinterpret via recast pair.
-        #   FIX (Bug 7/8): Allocate k_per_lane outputs per thread (not k).
-        # -------------------------------------------------------------------
-        topk_u32 = cute.recast_tensor(topk_regs, cutlass.Uint32)
-
-        k_per_lane = const_expr(self.k_per_lane)
-        out_vals   = cute.make_rmem_tensor(k_per_lane, self.output_dtype)
-        out_idx    = cute.make_rmem_tensor(k_per_lane, cutlass.Int32)
-
-        inv_sum = cutlass.Float32(1.0) / running_sum
-
-        for i in cutlass.range_constexpr(k_per_lane):
-            encoded   = topk_u32[i] & idx_mask
-            clean_u32 = topk_u32[i] & ~idx_mask
-
-            # Bitwise reinterpret: write clean bits, read as float, restore.
-            packed_saved   = topk_u32[i]
-            topk_u32[i]    = clean_u32
-            clean_f32      = topk_regs[i]   # float view of same register
-            topk_u32[i]    = packed_saved
-
-            # FIX (Bug 5): sign check on clean_f32, not topk_regs[i].
-            col_idx = (
-                (~encoded if clean_f32 >= cutlass.Float32(0.0) else encoded) & idx_mask
-            )
-            out_idx[i] = cutlass.Int32(col_idx)
-
-            # Softmax weight via emulated exp2 (FA4 §3.2).
-            sm_val = cute.arch.exp2(
-                (clean_f32 - running_max) * cutlass.Float32(LOG2E)
-            ) * inv_sum
-            out_vals[i] = sm_val.to(self.output_dtype)
-
-        # -------------------------------------------------------------------
-        # Step 5: Write topK results to HBM.
-        #
-        #   FIX (Bug 7): Each thread writes its own k_per_lane slice starting
-        #   at col_lane * k_per_lane.  The original guarded all writes with
-        #   `if col_lane == 0`, discarding (threads_per_row-1)/threads_per_row
-        #   of the topK results silently.
-        #
-        #   FIX (Bug 8): Since every thread now writes its slice, the
-        #   normalization work done in Step 4 is fully utilized.
-        # -------------------------------------------------------------------
-        elems_per_store = const_expr(math.gcd(self.vec, k_per_lane))
-        lane_out_start  = col_lane * k_per_lane
-
-        vals_sliced = cute.tiled_divide(out_vals, (elems_per_store,))
-        idx_sliced  = cute.tiled_divide(out_idx,  (elems_per_store,))
-
-        mV_row = cute.tiled_divide(
-            mTopKValues[global_row, lane_out_start : lane_out_start + k_per_lane],
-            (elems_per_store,),
-        )
-        mI_row = cute.tiled_divide(
-            mTopKIndices[global_row, lane_out_start : lane_out_start + k_per_lane],
-            (elems_per_store,),
-        )
-
-        for i in cutlass.range_constexpr(cute.size(vals_sliced.shape, [1])):
-            cute.autovec_copy(vals_sliced[None, i], mV_row[None, i])
-            cute.autovec_copy(idx_sliced[None, i],  mI_row[None, i])
+            # Write results element-by-element (CUTLASS DSL doesn't support dynamic slicing)
+            for out_idx_write in cutlass.range_constexpr(k_per_lane):
+                mTopKValues[global_row, lane_out_start + out_idx_write] = out_vals[out_idx_write]
+                mTopKIndices[global_row, lane_out_start + out_idx_write] = out_idx[out_idx_write]
 
 
-# ---------------------------------------------------------------------------
-# Section 4: Python-level launcher (drop-in replacement for TopK_Softmax)
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Section 4: Python-level launcher (drop-in replacement for TopK_Softmax)
+    # ---------------------------------------------------------------------------
 
 class FusedRouterTopKSoftmax_SM90:
     """
