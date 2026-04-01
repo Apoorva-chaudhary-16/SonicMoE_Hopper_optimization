@@ -1,129 +1,138 @@
 # ********************************************************************************
 # tests/bench_hopper_fa4.py
 #
-# PURPOSE:
-#   Measure the speedup from every FA4-inspired Hopper optimisation.
-#   Prints a clean table your supervisor can read directly.
+# Benchmark FA4-inspired Hopper optimisations for SonicMoE.
 #
-# HOW TO RUN:
-#   python tests/bench_hopper_fa4.py
-#   python tests/bench_hopper_fa4.py --warmup 10 --rep 100   # more reps for stability
+# FIX (Issue 4):
+#   The original file imported both TopK_Softmax and TopK_Softmax_Hopper from
+#   the same module, where both aliases now point to FusedRouterTopKSoftmax_SM90
+#   (the corrected fused kernel).  Benchmarking a kernel against itself always
+#   produces a 1.000× "speedup" and gives a completely misleading result.
 #
-# OUTPUT FORMAT:
-#   ┌─ Section 1: TopK + Softmax kernel (Kernel-1 merge, ex2.approx)
-#   ├─ Section 2: Expert aggregation kernel (gather-and-sum)
-#   └─ Section 3: End-to-end MoE forward (router + GEMM + aggregation)
+#   Because the repository no longer ships a separate legacy kernel to compare
+#   against, Section 1 and Section 4 now:
+#     (a) Use a PyTorch reference (torch.topk + F.softmax) as the "original"
+#         baseline.  This is the operation that the fused kernel replaces.
+#     (b) Note clearly in the output that this is a PyTorch baseline, not the
+#         original CuTe kernel.
 #
-# For each configuration it prints:
-#   Config │ Original (µs) │ Hopper FA4 (µs) │ Speedup │ Status
-#
-# EXPECTED RESULTS on H100:
-#   TopK+Softmax kernel:  ~15–25% faster
-#   Aggregation kernel:   ~2–5%  faster (mostly memory-bound, less impacted)
-#   End-to-end forward:   ~3–8%  faster overall (router is ~10% of total)
+#   If a legacy CuTe kernel is later reintroduced, swap `_topk_pytorch_ref`
+#   for an import of that class and the benchmark will automatically be
+#   meaningful again.
 # ********************************************************************************
 
 import argparse
+import statistics
 import time
+from functools import partial
 
 import torch
+import torch.nn.functional as F
 import cuda.bindings.driver as cuda
-import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from triton.testing import do_bench
 
-# ── original kernels ──────────────────────────────────────────────────────────
-from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax as TopK_Original
-from sonicmoe.functional.reduction_over_k_gather_hopper import (
-    token_gather_and_sum_varlen_K_triton as gather_original,
-)
-
-# ── FA4 Hopper-optimised kernels ──────────────────────────────────────────────
-from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax_Hopper as TopK_Hopper
+# ── FA4 fused kernel (the one being benchmarked) ──────────────────────────
+from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax_Hopper
 from sonicmoe.functional.reduction_over_k_gather_hopper import (
     token_gather_and_sum_varlen_K_triton as gather_hopper,
 )
 
-# ── full MoE ──────────────────────────────────────────────────────────────────
+# ── Full MoE ──────────────────────────────────────────────────────────────
 from sonicmoe import KernelBackendMoE, MoE
 from sonicmoe.enums import ActivationType
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Timing helpers
+# Formatting helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _us(ms: float) -> str:
-    """Format milliseconds as microseconds string."""
     return f"{ms * 1000:.1f} µs"
 
 
-def _speedup(orig_ms: float, new_ms: float) -> str:
-    s = orig_ms / new_ms
-    arrow = "✅ faster" if s > 1.005 else ("⚠️ same" if s > 0.995 else "❌ slower")
+def _speedup(baseline_ms: float, new_ms: float) -> str:
+    s     = baseline_ms / new_ms
+    arrow = "✅ faster" if s > 1.005 else ("⚠️  same" if s > 0.995 else "❌ slower")
     return f"{s:.3f}×  {arrow}"
 
 
-def _header(title: str):
-    w = 90
+def _header(title: str, baseline_label: str = "Baseline"):
+    w = 95
     print()
     print("═" * w)
     print(f"  {title}")
     print("═" * w)
-    print(f"  {'Config':<45} {'Original':>12} {'Hopper FA4':>12} {'Speedup'}")
+    print(
+        f"  {'Config':<45} {baseline_label:>18} {'Hopper FA4':>12} {'Speedup'}"
+    )
     print("─" * w)
 
 
-def _row(label: str, orig_ms: float, new_ms: float):
-    print(f"  {label:<45} {_us(orig_ms):>12} {_us(new_ms):>12}   {_speedup(orig_ms, new_ms)}")
-
-
-def _section_end():
-    print("─" * 90)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Section 1 — TopK + Softmax kernel
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _to_cute_1d(t):
-    return from_dlpack(t.detach(), assumed_align=16).mark_compact_shape_dynamic(
-        mode=0, stride_order=(0, 1)
+def _row(label: str, baseline_ms: float, new_ms: float):
+    print(
+        f"  {label:<45} {_us(baseline_ms):>18} {_us(new_ms):>12}   "
+        f"{_speedup(baseline_ms, new_ms)}"
     )
 
 
-def _compile_topk(cls, logits, scores, indices, K):
-    T, E = logits.shape
+def _section_end():
+    print("─" * 95)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PyTorch reference baseline for TopK + Softmax
+# Used in Sections 1 and 4 because both kernel aliases point to the same class.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _topk_pytorch_ref(logits: torch.Tensor, K: int):
+    """Pure PyTorch TopK + Softmax — the operation the fused kernel replaces."""
+    logits_f32 = logits.float()
+    vals, idx  = torch.topk(logits_f32, K, dim=-1)
+    scores     = F.softmax(vals, dim=-1)
+    return scores, idx.to(torch.int32)
+
+
+def _to_cute(t):
+    return (
+        from_dlpack(t.detach(), assumed_align=16)
+        .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+    )
+
+
+def _compile_hopper_topk(logits, scores, indices, K):
+    T, E         = logits.shape
     input_dtype  = torch2cute_dtype_map[logits.dtype]
     output_dtype = torch2cute_dtype_map[scores.dtype]
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    kernel = cls(input_dtype, output_dtype, E, K, require_softmax_fusion=True)
-    compiled = cute.compile(
+    stream       = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    kernel       = TopK_Softmax_Hopper(input_dtype, output_dtype, E, K,
+                                       require_softmax_fusion=True)
+    compiled     = cute.compile(
         kernel,
-        _to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream,
+        _to_cute(logits), _to_cute(scores), _to_cute(indices), stream,
     )
     return compiled, stream
 
 
-def bench_topk_softmax(warmup: int, rep: int):
-    """
-    Benchmark the router TopK+Softmax kernel.
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1 — TopK + Softmax kernel vs PyTorch baseline
+# ─────────────────────────────────────────────────────────────────────────────
 
-    This is the main beneficiary of:
-      (a) ex2.approx  — ~2× faster exp on Hopper SFU
-      (b) online-softmax Kernel-1 merge — one scan eliminated
-    """
-    _header("SECTION 1 · TopK + Softmax kernel  (router hot path)")
+def bench_topk_softmax(warmup: int, rep: int):
+    _header(
+        "SECTION 1 · TopK + Softmax kernel  (FA4 fused vs PyTorch baseline)",
+        baseline_label="PyTorch ref",
+    )
+    print("  NOTE: baseline is torch.topk + F.softmax (the op the kernel replaces).")
+    print("        A legacy CuTe original kernel is not separately available.")
 
     CONFIGS = [
-        # (T,     E,   K,  label)
-        (40960,  128,  8,  "1.4B  T=40960 E=128  K=8  "),
-        (24576,  64,   4,  "7B    T=24576 E=64   K=4  "),
-        (32768,  256, 16,  "30B   T=32768 E=256  K=16 "),
-        (32768,  256, 16,  "120B  T=32768 E=256  K=16 "),
-        (65536,  128,  8,  "large T=65536 E=128  K=8  "),
+        (40960, 128,  8,  "1.4B  T=40960 E=128  K=8  "),
+        (24576,  64,  4,  "7B    T=24576 E=64   K=4  "),
+        (32768, 256, 16,  "30B   T=32768 E=256  K=16 "),
+        (65536, 128,  8,  "large T=65536 E=128  K=8  "),
     ]
 
     for T, E, K, label in CONFIGS:
@@ -131,24 +140,22 @@ def bench_topk_softmax(warmup: int, rep: int):
         scores  = torch.zeros(T, K, device="cuda", dtype=torch.float32)
         indices = torch.zeros(T, K, device="cuda", dtype=torch.int32)
 
-        fn_orig, stream = _compile_topk(TopK_Original, logits, scores, indices, K)
-        fn_hop,  _      = _compile_topk(TopK_Hopper,   logits, scores, indices, K)
+        fn_hop, stream = _compile_hopper_topk(logits, scores, indices, K)
 
-        # warm-up
         for _ in range(warmup):
-            fn_orig(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream)
-            fn_hop( _to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream)
+            _topk_pytorch_ref(logits, K)
+            fn_hop(_to_cute(logits), _to_cute(scores), _to_cute(indices), stream)
         torch.cuda.synchronize()
 
-        t_orig = do_bench(
-            lambda: fn_orig(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream),
+        t_ref = do_bench(
+            lambda: _topk_pytorch_ref(logits, K),
             warmup=warmup, rep=rep,
         )
         t_hop = do_bench(
-            lambda: fn_hop(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream),
+            lambda: fn_hop(_to_cute(logits), _to_cute(scores), _to_cute(indices), stream),
             warmup=warmup, rep=rep,
         )
-        _row(label, t_orig, t_hop)
+        _row(label, t_ref, t_hop)
 
     _section_end()
 
@@ -158,17 +165,13 @@ def bench_topk_softmax(warmup: int, rep: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bench_gather_sum(warmup: int, rep: int):
-    """
-    Benchmark the expert aggregation (token gather-and-sum) kernel.
-
-    This kernel is memory-bound; the primary optimisation here is that weights
-    are pre-normalised (from the Kernel-1 merge) so no exp() runs here.
-    """
-    _header("SECTION 2 · Expert aggregation kernel  (gather-and-sum)")
+    _header(
+        "SECTION 2 · Expert aggregation kernel  (gather-and-sum)",
+        baseline_label="PyTorch ref",
+    )
 
     CONFIGS = [
-        # (T,    H,    K,  label)
-        (40960, 768,   8,  "1.4B  T=40960 H=768  K=8  "),
+        (40960,  768,  8,  "1.4B  T=40960 H=768  K=8  "),
         (24576, 1536,  4,  "7B    T=24576 H=1536 K=4  "),
         (32768, 4096, 16,  "30B   T=32768 H=4096 K=16 "),
         (32768, 4096,  8,  "30B   T=32768 H=4096 K=8  "),
@@ -177,47 +180,46 @@ def bench_gather_sum(warmup: int, rep: int):
     for T, H, K, label in CONFIGS:
         Mtotal   = T * K
         x        = torch.randn(Mtotal, H, device="cuda", dtype=torch.bfloat16)
-        w        = torch.rand(Mtotal,      device="cuda", dtype=torch.float32)
+        w        = torch.rand(Mtotal,     device="cuda", dtype=torch.float32)
         w_norm   = (w.view(T, K) / w.view(T, K).sum(-1, keepdim=True)).reshape(-1)
         M_perm   = torch.randperm(Mtotal, device="cuda", dtype=torch.int32)
         M_offset = (torch.arange(T + 1, device="cuda") * K).int()
         out      = torch.zeros(T, H, device="cuda", dtype=torch.float32)
 
-        def fn_orig():
-            gather_original(x, w_norm, out, M_perm, M_offset, T, K, H, is_varlen_K=False)
+        def fn_ref():
+            """PyTorch scatter-add baseline."""
+            x_f32 = x.float()
+            # Expand: x[M_perm] * w_norm, scatter-add to out
+            gathered = x_f32[M_perm.long()]             # (T*K, H)
+            scaled   = gathered * w_norm[:, None]        # (T*K, H)
+            rep_idx  = torch.arange(T, device="cuda").repeat_interleave(K)
+            torch.zeros_like(out).scatter_add_(0, rep_idx.unsqueeze(1).expand_as(scaled), scaled)
 
         def fn_hop():
             gather_hopper(x, w_norm, out, M_perm, M_offset, T, K, H, is_varlen_K=False)
 
         for _ in range(warmup):
-            fn_orig(); fn_hop()
+            fn_ref(); fn_hop()
         torch.cuda.synchronize()
 
-        t_orig = do_bench(fn_orig, warmup=warmup, rep=rep)
-        t_hop  = do_bench(fn_hop,  warmup=warmup, rep=rep)
-        _row(label, t_orig, t_hop)
+        t_ref = do_bench(fn_ref, warmup=warmup, rep=rep)
+        t_hop = do_bench(fn_hop, warmup=warmup, rep=rep)
+        _row(label, t_ref, t_hop)
 
     _section_end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 3 — End-to-end MoE forward
+# Section 3 — End-to-end MoE forward (SonicMoE Hopper vs PyTorch)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bench_e2e_forward(warmup: int, rep: int):
-    """
-    End-to-end MoE layer forward pass.
-
-    Measures wall-clock time for the full forward() including:
-      router GEMM + TopK + softmax + up-proj GEMM + down-proj GEMM + aggregation
-
-    The Hopper FA4 path is enabled when the new topk_softmax.py and
-    reduction_over_k_gather.py are in place (i.e. after renaming the files).
-    """
-    _header("SECTION 3 · End-to-end MoE forward  (full layer)")
+    _header(
+        "SECTION 3 · End-to-end MoE forward  (SonicMoE Hopper vs PyTorch)",
+        baseline_label="PyTorch MoE",
+    )
 
     CONFIGS = [
-        # (T,    H,    I,   E,   K,  label)
         (8192,  768,  256, 128,  8,  "1.4B  T=8192  H=768  I=256  E=128 K=8  "),
         (8192, 1536,  512,  64,  4,  "7B    T=8192  H=1536 I=512  E=64  K=4  "),
         (8192, 4096,  512, 128,  8,  "30B   T=8192  H=4096 I=512  E=128 K=8  "),
@@ -248,7 +250,6 @@ def bench_e2e_forward(warmup: int, rep: int):
             with torch.autocast(device.type, torch.float32):
                 moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
 
-        # warm up JIT / compile cache
         for _ in range(max(warmup, 5)):
             fn_sonic()
         torch.cuda.synchronize()
@@ -261,17 +262,17 @@ def bench_e2e_forward(warmup: int, rep: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 4 — Router-only isolation
-#   Isolates the speedup due ONLY to the router (topK + softmax).
-#   Runs the router N times and measures kernel time via CUDA events.
+# Section 4 — Router-only isolation (CUDA-event timing)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bench_router_isolated(warmup: int, rep: int):
-    """
-    Isolates the router kernel using CUDA events for precise sub-ms timing.
-    This directly shows the improvement from ex2.approx + online-softmax merge.
-    """
-    _header("SECTION 4 · Router kernel isolated  (CUDA-event timing)")
+    _header(
+        "SECTION 4 · Router kernel isolated  (CUDA-event timing, vs PyTorch baseline)",
+        baseline_label="PyTorch ref",
+    )
+    print(
+        "  NOTE: baseline is torch.topk + F.softmax (full-precision reference)."
+    )
 
     CONFIGS = [
         (40960, 128,  8,  "1.4B T=40960 E=128  K=8  "),
@@ -279,85 +280,70 @@ def bench_router_isolated(warmup: int, rep: int):
         (32768, 256, 16,  "30B  T=32768 E=256  K=16 "),
     ]
 
+    start_e = torch.cuda.Event(enable_timing=True)
+    end_e   = torch.cuda.Event(enable_timing=True)
+
     for T, E, K, label in CONFIGS:
         logits  = torch.randn(T, E, device="cuda", dtype=torch.bfloat16)
         scores  = torch.zeros(T, K, device="cuda", dtype=torch.float32)
         indices = torch.zeros(T, K, device="cuda", dtype=torch.int32)
 
-        fn_orig, stream = _compile_topk(TopK_Original, logits, scores, indices, K)
-        fn_hop,  _      = _compile_topk(TopK_Hopper,   logits, scores, indices, K)
+        fn_hop, stream = _compile_hopper_topk(logits, scores, indices, K)
 
         for _ in range(warmup):
-            fn_orig(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream)
+            _topk_pytorch_ref(logits, K)
+            fn_hop(_to_cute(logits), _to_cute(scores), _to_cute(indices), stream)
         torch.cuda.synchronize()
 
-        # CUDA event timing
-        start_e = torch.cuda.Event(enable_timing=True)
-        end_e   = torch.cuda.Event(enable_timing=True)
+        times_ref, times_hop = [], []
 
-        # --- original ---
-        times_orig = []
         for _ in range(rep):
             start_e.record()
-            fn_orig(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream)
-            end_e.record()
-            end_e.synchronize()
-            times_orig.append(start_e.elapsed_time(end_e))
+            _topk_pytorch_ref(logits, K)
+            end_e.record(); end_e.synchronize()
+            times_ref.append(start_e.elapsed_time(end_e))
 
-        # --- hopper ---
-        times_hop = []
         for _ in range(rep):
             start_e.record()
-            fn_hop(_to_cute_1d(logits), _to_cute_1d(scores), _to_cute_1d(indices), stream)
-            end_e.record()
-            end_e.synchronize()
+            fn_hop(_to_cute(logits), _to_cute(scores), _to_cute(indices), stream)
+            end_e.record(); end_e.synchronize()
             times_hop.append(start_e.elapsed_time(end_e))
 
-        import statistics
-        t_orig = statistics.median(times_orig)
-        t_hop  = statistics.median(times_hop)
+        t_ref = statistics.median(times_ref)
+        t_hop = statistics.median(times_hop)
 
-        _row(
-            f"{label} [median of {rep}]",
-            t_orig, t_hop,
-        )
+        _row(f"{label} [median of {rep}]", t_ref, t_hop)
 
     _section_end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 5 — Summary table (expected vs actual)
+# Section 5 — Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_summary():
-    w = 90
+    w = 95
     print()
     print("═" * w)
-    print("  SUMMARY — What each optimisation does and where to see it")
+    print("  SUMMARY — FA4 Hopper optimisations")
     print("═" * w)
     rows = [
         ("ex2.approx (FA4 §3.1)",
          "topk_softmax_hopper.py",
          "~2× faster exp on Hopper SFU",
-         "Section 1 & 4"),
+         "Sections 1 & 4"),
         ("Online softmax Kernel-1 merge (FA4 §3.2)",
          "topk_softmax_hopper.py",
-         "Eliminates 1 register scan over K",
-         "Section 1 & 4"),
+         "Eliminates 1 register scan over E",
+         "Sections 1 & 4"),
         ("Pre-normalised weights in aggregation",
          "reduction_over_k_gather_hopper.py",
          "No exp() in gather-sum kernel",
          "Section 2"),
-        ("2-CTA cluster gather (already correct)",
-         "moe_config.py  [no change]",
-         "Already implemented on Hopper",
-         "N/A"),
-        ("TMEM pipeline",
-         "N/A — Blackwell only",
-         "Skip for Hopper",
-         "N/A"),
     ]
-    print(f"  {'Optimisation':<42} {'File':<38} {'Expected gain':<30} {'Benchmark'}")
+    print(
+        f"  {'Optimisation':<42} {'File':<38} {'Expected gain':<30} {'Benchmark'}"
+    )
     print("─" * w)
     for opt, f, gain, bench in rows:
         print(f"  {opt:<42} {f:<38} {gain:<30} {bench}")
@@ -373,35 +359,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark FA4 Hopper optimisations for SonicMoE"
     )
-    parser.add_argument("--warmup", type=int, default=5,
-                        help="Number of warmup iterations (default: 5)")
-    parser.add_argument("--rep",    type=int, default=50,
-                        help="Number of timed iterations (default: 50)")
+    parser.add_argument("--warmup",  type=int, default=5)
+    parser.add_argument("--rep",     type=int, default=50)
     parser.add_argument("--section", type=int, default=0,
                         help="Run only section N (0 = all, 1-5)")
     args = parser.parse_args()
 
     print()
-    print("╔══════════════════════════════════════════════════════════════════════════════════╗")
-    print("║  SonicMoE — FA4 Hopper Optimisation Benchmark                                  ║")
-    print("║  GPU:", torch.cuda.get_device_name(0).ljust(69), "║")
-    print("╚══════════════════════════════════════════════════════════════════════════════════╝")
+    print("╔══════════════════════════════════════════════════════════════════════════╗")
+    print("║  SonicMoE — FA4 Hopper Optimisation Benchmark                          ║")
+    print("║  GPU:", torch.cuda.get_device_name(0).ljust(65), "║")
+    print("╚══════════════════════════════════════════════════════════════════════════╝")
 
     torch.cuda.set_device(0)
 
     run_all = args.section == 0
-
     if run_all or args.section == 1:
         bench_topk_softmax(args.warmup, args.rep)
-
     if run_all or args.section == 2:
         bench_gather_sum(args.warmup, args.rep)
-
     if run_all or args.section == 3:
         bench_e2e_forward(args.warmup, args.rep)
-
     if run_all or args.section == 4:
         bench_router_isolated(args.warmup, args.rep)
-
     if run_all or args.section == 5:
         print_summary()

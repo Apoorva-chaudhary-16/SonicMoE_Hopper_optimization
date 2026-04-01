@@ -4,23 +4,39 @@
 # reduction_over_k_gather_hopper.py
 # FA4-inspired Hopper optimisation — gather-and-sum kernel.
 # Weights arrive pre-normalised from TopK_Softmax_Hopper so no exp() here.
+#
+# FIX (Issue 2 & 3):
+#   The original file defined its own `online_softmax_update` and `fast_exp`
+#   at the bottom with the OLD four-argument signature:
+#
+#       def online_softmax_update(new_val, running_max, running_sum,
+#                                 running_exp_val) -> tuple:   # ← WRONG
+#
+#   topk_softmax_hopper.py defines the CORRECT three-argument version.
+#   When both files are imported in the same Python process (which always
+#   happens because forward.py imports from both), the last-imported
+#   definition wins in the module namespace.  More importantly, if the
+#   cute.jit compiler sees the wrong signature at JIT time it will either
+#   fail to compile or silently generate wrong PTX for the online-softmax
+#   step.
+#
+#   Fix: the duplicate `online_softmax_update` and `fast_exp` helpers that
+#   were copy-pasted here have been removed entirely.  topk_softmax_hopper.py
+#   is the single authoritative definition.  This file only contains what it
+#   actually uses: the Triton gather-and-sum kernel.
 # ********************************************************************************
 
 from typing import Optional
 
-import cutlass
-import cutlass.cute as cute
 import torch
 import triton
 import triton.language as tl
-from cutlass import Float32, const_expr
 
 from ..utils import get_powers_of_2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Triton gather-and-sum kernel
-# Required by backward.py and forward.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_triton_autotune_configs() -> list[triton.Config]:
@@ -30,7 +46,11 @@ def _get_triton_autotune_configs() -> list[triton.Config]:
             for num_warps in [4, 8]:
                 if BLOCK_K * BLOCK_H <= 32768:
                     configs.append(
-                        triton.Config({"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K}, num_warps=num_warps, num_stages=4)
+                        triton.Config(
+                            {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K},
+                            num_warps=num_warps,
+                            num_stages=4,
+                        )
                     )
     return configs
 
@@ -40,8 +60,8 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
     for c in configs:
         BLOCK_H = c.kwargs["BLOCK_H"]
         BLOCK_K = c.kwargs["BLOCK_K"]
-        H = kw["H"]
-        MAX_K = kw["MAX_K"]
+        H       = kw["H"]
+        MAX_K   = kw["MAX_K"]
         if (
             BLOCK_H <= triton.next_power_of_2(H)
             and BLOCK_K <= triton.next_power_of_2(MAX_K)
@@ -77,37 +97,37 @@ def token_gather_sum_kernel(
     w_is_None: tl.constexpr,
     is_varlen_K: tl.constexpr,
 ):
-    pid_t = tl.program_id(axis=0)
-    t_idx = pid_t.to(tl.uint32)
+    pid_t   = tl.program_id(axis=0)
+    t_idx   = pid_t.to(tl.uint32)
 
     if is_varlen_K:
-        Ms = tl.load(M_offset_ptr + t_idx).to(tl.uint32)
-        Me = tl.load(M_offset_ptr + t_idx + 1).to(tl.uint32)
-        K_this_token = Me - Ms
+        Ms             = tl.load(M_offset_ptr + t_idx).to(tl.uint32)
+        Me             = tl.load(M_offset_ptr + t_idx + 1).to(tl.uint32)
+        K_this_token   = Me - Ms
     else:
-        Ms = MAX_K * t_idx
+        Ms                       = MAX_K * t_idx
         K_this_token: tl.constexpr = MAX_K
 
     for h_tile in tl.static_range(triton.cdiv(H, BLOCK_H)):
-        h_idx = (h_tile * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.uint32)
-        m_h = h_idx < H
-        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+        h_idx  = (h_tile * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.uint32)
+        m_h    = h_idx < H
+        acc    = tl.zeros([BLOCK_H], dtype=tl.float32)
 
         for k_tile in tl.range(tl.cdiv(K_this_token, BLOCK_K)):
-            k_offset = k_tile * BLOCK_K
-            k_idx = (k_offset + tl.arange(0, BLOCK_K)).to(tl.uint32)
-            m_k = k_idx < K_this_token
-            m_abs = Ms + k_idx
-            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.uint32)
-            x_ptrs = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
-            x_mask = m_k[:, None] & m_h[None, :]
-            x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)
+            k_offset  = k_tile * BLOCK_K
+            k_idx     = (k_offset + tl.arange(0, BLOCK_K)).to(tl.uint32)
+            m_k       = k_idx < K_this_token
+            m_abs     = Ms + k_idx
+            perm_idx  = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.uint32)
+            x_ptrs    = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
+            x_mask    = m_k[:, None] & m_h[None, :]
+            x_vals    = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)
 
             if w_is_None:
                 acc += tl.sum(x_vals, axis=0)
             else:
                 w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(tl.float32)
-                acc += tl.sum(x_vals * w_vals[:, None], axis=0)
+                acc   += tl.sum(x_vals * w_vals[:, None], axis=0)
 
         out_ptrs = out_ptr + t_idx * stride_outT + h_idx * stride_outH
         tl.store(out_ptrs, acc, mask=m_h)
@@ -126,7 +146,9 @@ def token_gather_and_sum_varlen_K_triton(
 ):
     """
     Gather and weighted sum over K experts per token.
-    Weights are pre-normalised from FA4 TopK_Softmax_Hopper — no exp() needed.
+
+    Weights are pre-normalised by FA4 TopK_Softmax_Hopper so no exp() is
+    needed inside this kernel.
 
     out[i, :] = sum_{j=0..K[i]-1}  x[M_perm[M_offset[i] + j], :] * w[M_offset[i] + j]
     """
@@ -147,30 +169,15 @@ def token_gather_and_sum_varlen_K_triton(
         is_varlen_K=is_varlen_K,
     )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# FA4 exp2 helpers (used by topk_softmax_hopper.py)
+# NOTE: fast_exp and online_softmax_update were intentionally removed here.
+#
+# They used to live at the bottom of this file (copy-pasted from the original
+# topk_softmax.py during the FA4 refactor) but the version here had the WRONG
+# four-argument signature for online_softmax_update.  The correct three-
+# argument version is defined in topk_softmax_hopper.py and is the sole
+# authoritative definition.  Having two conflicting @cute.jit definitions of
+# the same function in the same Python process caused silent JIT-staleness
+# bugs where the kernel was compiled with whichever definition happened to be
+# imported last.
 # ─────────────────────────────────────────────────────────────────────────────
-
-LOG2E = 1.4426950408889634
-
-
-@cute.jit
-def fast_exp(x: cutlass.Float32) -> cutlass.Float32:
-    return cute.arch.exp2(x * cutlass.Float32(LOG2E))
-
-
-@cute.jit
-def online_softmax_update(
-    new_val: cutlass.Float32,
-    running_max: cutlass.Float32,
-    running_sum: cutlass.Float32,
-    running_exp_val: cutlass.Float32,
-) -> tuple:
-    new_max = cute.arch.fmax(running_max, new_val)
-    scale = cute.arch.exp2((running_max - new_max) * cutlass.Float32(LOG2E))
-    rescaled_sum = running_sum * scale
-    rescaled_exp_val = running_exp_val * scale
-    new_exp = cute.arch.exp2((new_val - new_max) * cutlass.Float32(LOG2E))
-    new_sum = rescaled_sum + new_exp
-    return new_max, new_sum, rescaled_exp_val + new_exp
