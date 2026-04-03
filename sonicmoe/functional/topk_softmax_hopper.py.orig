@@ -1,11 +1,5 @@
-# ********************************************************************************
-# FA4-Inspired: TopK + Softmax with exp2 optimisation
-# Pure PyTorch implementation (compatible with all driver versions)
-# ********************************************************************************
-
 import math
 from typing import Type
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -16,13 +10,8 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 LOG2E = 1.4426950408889634
 
 def topk_softmax_triton(x, k, values, indices, require_softmax_fusion=True):
-    """
-    Fused TopK + Softmax using FA4-style exp2.
-    exp(x) = exp2(x * log2e) maps to Hopper H100 SFU ex2 instruction.
-    """
     logits_f32 = x.float()
     topk_vals, topk_idx = torch.topk(logits_f32, k, dim=-1)
-    # FA4 section 3.1: softmax via exp2(x * log2e)
     shifted = topk_vals - topk_vals.max(dim=-1, keepdim=True).values
     exp_vals = torch.exp2(shifted * LOG2E)
     softmax_vals = exp_vals / exp_vals.sum(dim=-1, keepdim=True)
@@ -51,8 +40,7 @@ def test_fused_vs_separate(T=1024, E=128, k=8, dtype=torch.bfloat16):
     ref_idx_sorted, _ = ref_idx.sort(dim=-1)
     fused_idx_sorted, _ = fused_idx.sort(dim=-1)
     assert torch.all(ref_idx_sorted == fused_idx_sorted), "TopK index mismatch"
-    max_err = (ref_sm.gather(1, ref_idx.argsort(dim=-1)) -
-               fused_vals.gather(1, fused_idx.long().argsort(dim=-1))).abs().max().item()
+    max_err = (ref_sm.gather(1, ref_idx.argsort(dim=-1)) - fused_vals.gather(1, fused_idx.long().argsort(dim=-1))).abs().max().item()
     assert max_err < 2e-3, f"Softmax error: {max_err}"
     print(f"[PASS] T={T}, E={E}, k={k} (max_err={max_err:.2e})")
 

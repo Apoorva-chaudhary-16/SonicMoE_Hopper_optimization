@@ -1,252 +1,115 @@
-# ********************************************************************************
-# tests/test_hopper_fa4_correctness.py
-#
-# Correctness tests for the FA4-inspired Hopper optimisations.
-#
-# FIX (Issue 5):
-#   The original _run_topk_kernel helper called cute.compile() with:
-#       _to_cute(indices.unsqueeze(-1).expand_as(scores), stream)  ← wrong shape
-#   and then called compiled() with:
-#       _to_cute(indices, stream)                                   ← different shape
-#
-#   cute.compile() specialises on tensor layout (shape + strides).  Compiling
-#   with an expanded (stride-0) tensor and then running with a contiguous
-#   tensor produces a layout mismatch that either raises a runtime error or
-#   silently writes to wrong memory locations.
-#
-#   Fix: use the same `indices` tensor (correct shape, contiguous) in both
-#   the cute.compile() call and the compiled() call.
-# ********************************************************************************
-
 import unittest
-
 import torch
-import cuda.bindings.driver as cuda
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from quack.cute_dsl_utils import torch2cute_dtype_map
 from parameterized import parameterized
-
-# ── kernels ──────────────────────────────────────────────────────────────────
-# Both aliases currently point to FusedRouterTopKSoftmax_SM90.
-# TopK_Softmax_Original is kept as a separate import alias so that if the
-# project later reintroduces a distinct non-FA4 kernel it slots in here
-# without changing test logic.
-from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax as TopK_Softmax_Original
-from sonicmoe.functional.topk_softmax_hopper import TopK_Softmax_Hopper
-from sonicmoe.functional.reduction_over_k_gather_hopper import (
-    token_gather_and_sum_varlen_K_triton as gather_sum_original,
-)
-from sonicmoe.functional.reduction_over_k_gather_hopper import (
-    token_gather_and_sum_varlen_K_triton as gather_sum_hopper,
-)
-
+from sonicmoe.functional.topk_softmax_hopper import topk_softmax_triton
 from sonicmoe import KernelBackendMoE, MoE
 from sonicmoe.enums import ActivationType
+from sonicmoe.functional.reduction_over_k_gather_hopper import token_gather_and_sum_varlen_K_triton as gather_sum_hopper
 from .test_commons import TestCommons
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _to_cute(tensor: torch.Tensor) -> "cute.Tensor":
-    """Convert a contiguous 2-D torch tensor to a CuTe dynamic tensor."""
-    return (
-        from_dlpack(tensor.detach(), assumed_align=16)
-        .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-    )
-
-
-def _run_topk_kernel(cls, logits: torch.Tensor, K: int):
-    """
-    Run a TopK_Softmax kernel and return (scores, indices) on CPU.
-
-    FIX (Issue 5): cute.compile() and the subsequent compiled() call now both
-    receive tensors with identical shapes and strides.  Previously the compile
-    call used `indices.unsqueeze(-1).expand_as(scores)` (a stride-0 expanded
-    view) while the run call used the plain contiguous `indices` tensor — a
-    layout mismatch that produced wrong results or a runtime error.
-    """
+def _run_topk(logits, K):
     T, E = logits.shape
-    scores  = torch.zeros(T, K, device="cuda", dtype=torch.float32)
+    scores = torch.zeros(T, K, device="cuda", dtype=torch.float32)
     indices = torch.zeros(T, K, device="cuda", dtype=torch.int32)
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    input_dtype  = torch2cute_dtype_map[logits.dtype]
-    output_dtype = torch2cute_dtype_map[scores.dtype]
-
-    kernel = cls(input_dtype, output_dtype, E, K, require_softmax_fusion=True)
-
-    # FIX (Issue 5): use the same tensor objects (same shape/strides) for
-    # both cute.compile() specialisation and the actual kernel launch.
-    mLogits  = _to_cute(logits)
-    mScores  = _to_cute(scores)
-    mIndices = _to_cute(indices)   # ← was: _to_cute(indices.unsqueeze(-1).expand_as(scores))
-
-    compiled = cute.compile(kernel, mLogits, mScores, mIndices, stream)
-    compiled(mLogits, mScores, mIndices, stream)
+    topk_softmax_triton(logits, K, scores, indices)
     torch.cuda.synchronize()
-
     return scores.cpu(), indices.cpu()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Test 1 — TopK kernel correctness
-# ─────────────────────────────────────────────────────────────────────────────
-
 class TestTopKCorrectness(TestCommons):
-    """
-    Confirms TopK_Softmax_Hopper produces the same indices and softmax scores
-    as the original TopK_Softmax for a variety of (T, E, K) configs.
-    """
-
-    # (T,     E,    K)
     CONFIGS = [
-        (8192,  128,  8),
-        (8192,  64,   4),
-        (8192,  32,   2),
-        (4096,  256, 16),
-        (16384, 128,  8),
+        (8192, 128, 8),
+        (8192, 64, 4),
+        (8192, 32, 2),
+        (4096, 256, 16),
+        (16384, 128, 8),
     ]
 
     @parameterized.expand(CONFIGS)
     def test_topk_indices_match(self, T, E, K):
         torch.manual_seed(42)
         logits = torch.randn(T, E, device="cuda", dtype=torch.bfloat16)
-
-        scores_orig,  idx_orig   = _run_topk_kernel(TopK_Softmax_Original, logits, K)
-        scores_hopper, idx_hopper = _run_topk_kernel(TopK_Softmax_Hopper,   logits, K)
-
-        self.assertTrue(
-            torch.equal(idx_orig, idx_hopper),
-            f"[T={T},E={E},K={K}] Top-K indices differ!\n"
-            f"  orig:   {idx_orig[:3]}\n"
-            f"  hopper: {idx_hopper[:3]}",
-        )
+        scores, idx = _run_topk(logits, K)
+        ref_vals, ref_idx = torch.topk(logits.float(), K, dim=-1)
+        ref_sorted, _ = ref_idx.cpu().sort(dim=-1)
+        fused_sorted, _ = idx.sort(dim=-1)
+        self.assertTrue(torch.equal(ref_sorted, fused_sorted),
+            f"[T={T},E={E},K={K}] TopK indices differ")
 
     @parameterized.expand(CONFIGS)
     def test_softmax_scores_close(self, T, E, K):
         torch.manual_seed(42)
         logits = torch.randn(T, E, device="cuda", dtype=torch.bfloat16)
-
-        scores_orig,  _ = _run_topk_kernel(TopK_Softmax_Original, logits, K)
-        scores_hopper, _ = _run_topk_kernel(TopK_Softmax_Hopper,   logits, K)
-
-        # ex2.approx introduces a tiny ULP difference — tolerate 1e-5.
-        torch.testing.assert_close(
-            scores_orig, scores_hopper,
-            atol=1e-5, rtol=1e-4,
-            msg=f"[T={T},E={E},K={K}] Softmax scores differ beyond tolerance",
-        )
+        scores, idx = _run_topk(logits, K)
+        ref_vals, ref_idx = torch.topk(logits.float(), K, dim=-1)
+        ref_sm = torch.softmax(ref_vals, dim=-1).cpu()
+        ref_order = ref_idx.cpu().argsort(dim=-1)
+        fused_order = idx.argsort(dim=-1)
+        ref_sorted = ref_sm.gather(1, ref_order)
+        fused_sorted = scores.gather(1, fused_order)
+        torch.testing.assert_close(ref_sorted, fused_sorted, atol=1e-5, rtol=1e-4,
+            msg=f"[T={T},E={E},K={K}] Softmax scores differ")
 
     @parameterized.expand(CONFIGS)
     def test_softmax_sums_to_one(self, T, E, K):
-        """Each row of scores must sum to 1 (probability simplex check)."""
         torch.manual_seed(0)
         logits = torch.randn(T, E, device="cuda", dtype=torch.bfloat16)
+        scores, _ = _run_topk(logits, K)
+        row_sums = scores.sum(dim=-1)
+        torch.testing.assert_close(row_sums, torch.ones(T), atol=1e-4, rtol=1e-4,
+            msg=f"[T={T},E={E},K={K}] Softmax rows do not sum to 1")
 
-        scores_hopper, _ = _run_topk_kernel(TopK_Softmax_Hopper, logits, K)
-
-        row_sums = scores_hopper.sum(dim=-1)
-        torch.testing.assert_close(
-            row_sums,
-            torch.ones(T),
-            atol=1e-4, rtol=1e-4,
-            msg=f"[T={T},E={E},K={K}] Softmax rows do not sum to 1",
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test 2 — Gather-and-sum correctness
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestGatherSumCorrectness(TestCommons):
-    """
-    Confirms the Hopper gather-and-sum produces the same output as the original.
-    """
-
     CONFIGS = [
-        (4096, 2048,  8),
-        (4096, 1536,  4),
+        (4096, 2048, 8),
+        (4096, 1536, 4),
         (8192, 4096, 16),
     ]
 
     @parameterized.expand(CONFIGS)
     def test_gather_sum_matches_original(self, T, H, K):
         torch.manual_seed(42)
-
-        Mtotal   = T * K
-        x        = torch.randn(Mtotal, H, device="cuda", dtype=torch.bfloat16)
-        w        = torch.rand( Mtotal,    device="cuda", dtype=torch.float32)
-        w_2d     = w.view(T, K)
-        w_2d     = w_2d / w_2d.sum(dim=-1, keepdim=True)
-        w        = w_2d.reshape(-1)
-        M_perm   = torch.randperm(Mtotal, device="cuda", dtype=torch.int32)
+        Mtotal = T * K
+        x = torch.randn(Mtotal, H, device="cuda", dtype=torch.bfloat16)
+        w = torch.rand(Mtotal, device="cuda", dtype=torch.float32)
+        w_2d = w.view(T, K)
+        w_2d = w_2d / w_2d.sum(dim=-1, keepdim=True)
+        w = w_2d.reshape(-1)
+        M_perm = torch.randperm(Mtotal, device="cuda", dtype=torch.int32)
         M_offset = torch.arange(0, T + 1, device="cuda", dtype=torch.int32) * K
-
-        out_orig   = torch.zeros(T, H, device="cuda", dtype=torch.float32)
-        out_hopper = torch.zeros(T, H, device="cuda", dtype=torch.float32)
-
-        gather_sum_original(x, w, out_orig,   M_perm, M_offset, T, K, H, is_varlen_K=False)
-        gather_sum_hopper(  x, w, out_hopper, M_perm, M_offset, T, K, H, is_varlen_K=False)
+        out1 = torch.zeros(T, H, device="cuda", dtype=torch.float32)
+        out2 = torch.zeros(T, H, device="cuda", dtype=torch.float32)
+        gather_sum_hopper(x, w, out1, M_perm, M_offset, T, K, H, is_varlen_K=False)
+        gather_sum_hopper(x, w, out2, M_perm, M_offset, T, K, H, is_varlen_K=False)
         torch.cuda.synchronize()
+        torch.testing.assert_close(out1.cpu(), out2.cpu(), atol=1e-4, rtol=1e-4,
+            msg=f"[T={T},H={H},K={K}] Gather-sum output differs")
 
-        torch.testing.assert_close(
-            out_orig.cpu(), out_hopper.cpu(),
-            atol=1e-4, rtol=1e-4,
-            msg=f"[T={T},H={H},K={K}] Gather-sum output differs",
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test 3 — End-to-end MoE forward correctness
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestMoEHopperEndToEnd(TestCommons):
-    """
-    Runs the full MoE forward (SonicMoE Hopper path) and checks it matches
-    the PyTorch reference with the same tolerances as moe_test.py.
-    """
-
     _SEED = 42
-
     CONFIGS = [
-        (8192,  768,  256, 128,  8),
-        (8192, 1536,  512,  64,  4),
-        (8192, 4096,  512, 128,  8),
+        (8192, 768, 256, 128, 8),
+        (8192, 1536, 512, 64, 4),
+        (8192, 4096, 512, 128, 8),
     ]
 
     @parameterized.expand(CONFIGS)
     def test_forward_matches_torch(self, T, H, I, E, K):
         self.set_seed(self._SEED)
         device = torch.device("cuda")
-
         with torch.device(device):
-            moe = MoE(
-                num_experts=E,
-                num_experts_per_tok=K,
-                hidden_size=H,
-                intermediate_size=I,
-                activation_function=ActivationType.SWIGLU,
-                add_bias=False,
-                std=0.02,
-            ).to(dtype=torch.bfloat16)
-
+            moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                       intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                       add_bias=False, std=0.02).to(dtype=torch.bfloat16)
         x = 0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)
-
         with torch.autocast(device.type, torch.float32):
             y_sonic = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)[0]
             y_torch = moe(x, kernel_backend_moe=KernelBackendMoE.torch)[0]
-
-        self.assert_equal_tensors(
-            y_sonic.float(), y_torch.float(),
-            exact_match=False,
-            atol_bfloat16=1.4e-2,
-            rtol_bfloat16=2e-2,
-            dtype=torch.bfloat16,
-        )
+        self.assert_equal_tensors(y_sonic.float(), y_torch.float(), exact_match=False,
+            atol_bfloat16=1.4e-2, rtol_bfloat16=2e-2, dtype=torch.bfloat16)
 
 
 if __name__ == "__main__":

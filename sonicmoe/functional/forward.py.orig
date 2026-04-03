@@ -1,7 +1,3 @@
-# ********************************************************************************
-# forward.py — Hopper-optimised MoE forward pass (FA4 exp2 path)
-# ********************************************************************************
-
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
